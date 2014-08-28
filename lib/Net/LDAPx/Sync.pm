@@ -4,12 +4,14 @@ use Moo;
 no warnings "uninitialized";
 
 use Carp;
+use Data::Dump  qw/pp/;
 use Try::Tiny;
 
 use Net::LDAP;
 use Net::LDAP::Constant qw[
     LDAP_SUCCESS LDAP_CANCELED
     LDAP_SYNC_REFRESH_ONLY LDAP_SYNC_REFRESH_AND_PERSIST
+    LDAP_SYNC_ADD LDAP_SYNC_MODIFY LDAP_SYNC_DELETE
     LDAP_CONTROL_SYNC_STATE LDAP_CONTROL_SYNC_DONE
 ];
 use Net::LDAP::Extension::Cancel;
@@ -24,6 +26,17 @@ has callback    => is => "rw";
 has cookie      => is => "rw";
 
 has search      => is => "rw", predicate => 1, clearer => 1;
+has cache       => is => "ro", predicate => 1;
+
+sub BUILDARGS {
+    my ($class, @args) = @_;
+    my $args = @args == 1 ? $args[0] : { @args };
+
+    $$args{cache} && !ref $$args{cache} 
+        and $$args{cache} = {};
+
+    $args;
+}
 
 sub info { warn "$_[0]\n" }
 
@@ -51,6 +64,30 @@ sub update_cookie {
     $control;
 }
 
+sub update_cache {
+    my ($self, $entry, $control) = @_;
+    my $cache = $self->cache;
+
+    my $st = $control->state;
+    my $uu = $control->entryUUID;
+    if ($st == LDAP_SYNC_ADD || $st == LDAP_SYNC_MODIFY) {
+        $$cache{$uu} = $entry;
+    }
+    elsif ($st == LDAP_SYNC_DELETE) {
+        delete $$cache{$uu};
+    }
+    else {
+        # PRESENT
+        die "Unknown sync info state [$st]";
+    }
+}
+
+sub results {
+    my ($self) = @_;
+    my $cache = $self->cache;
+    values %$cache;
+}
+
 sub _do_callback {
     my ($self, $srch, $entry, $ref) = @_;
     info "CALLBACK [$entry]";
@@ -58,6 +95,7 @@ sub _do_callback {
 
     if (!$entry) {  return }
     elsif ($entry->isa("Net::LDAP::Entry")) {
+        $self->has_cache and $self->update_cache($entry, $control);
         $self->callback->($srch, $entry, $ref, $control)
             and $self->stop_sync;
     }
