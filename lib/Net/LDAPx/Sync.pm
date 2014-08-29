@@ -5,6 +5,7 @@ no warnings "uninitialized";
 
 use Carp;
 use Data::Dump  qw/pp/;
+use Data::UUID;
 use Try::Tiny;
 
 use Net::LDAP;
@@ -32,11 +33,16 @@ sub BUILDARGS {
     my ($class, @args) = @_;
     my $args = @args == 1 ? $args[0] : { @args };
 
+    $$args{thaw} and $class->_thaw($args);
+
     $$args{cache} && !ref $$args{cache} 
         and $$args{cache} = {};
 
     $args;
 }
+
+# I think someone doesn't understand what objects are for...
+my $UUID = Data::UUID->new;
 
 sub info { warn "$_[0]\n" }
 
@@ -86,6 +92,57 @@ sub results {
     my ($self) = @_;
     my $cache = $self->cache;
     values %$cache;
+}
+
+my $FreezeVersion = 1;
+
+sub freeze {
+    my ($self) = @_;
+    my $cache = $self->cache or return;
+
+    return {
+        version     => $FreezeVersion,
+        cookie      => $self->cookie,
+        cache       => {
+            map {
+                my $e = $$cache{$_};
+                (   $UUID->to_string($_),
+                    [   $e->dn,
+                        map +($_, [$e->get_value($_)]),
+                            $e->attributes,
+                    ],
+                );
+            } keys %$cache,
+        },
+    };
+}
+
+# class method, called from BUILDARGS
+sub _thaw {
+    my ($class, $args) = @_;
+    
+    my $data    = $$args{thaw};
+    my $vers    = $$data{version};
+    my $meth    = $class->can("_thaw_$vers")
+        or croak "Unknown freeze version [$vers]";
+
+    $class->$meth($data, $args);
+}
+
+sub _thaw_1 {
+    my ($class, $data, $args) = @_;
+
+    require Net::LDAP::Entry;
+
+    $$args{cookie}  = $$data{cookie};
+
+    my $cache       = $$data{cache};
+    $$args{cache}   = {
+        map +(
+            $UUID->from_string($_),
+            Net::LDAP::Entry->new(@{$$cache{$_}}),
+        ), keys %$cache,
+    };
 }
 
 sub _do_callback {
