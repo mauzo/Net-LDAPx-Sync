@@ -12,7 +12,7 @@ use Net::LDAP;
 use Net::LDAP::Constant qw[
     LDAP_SUCCESS LDAP_CANCELED
     LDAP_SYNC_REFRESH_ONLY LDAP_SYNC_REFRESH_AND_PERSIST
-    LDAP_SYNC_ADD LDAP_SYNC_MODIFY LDAP_SYNC_DELETE
+    LDAP_SYNC_ADD LDAP_SYNC_MODIFY LDAP_SYNC_DELETE LDAP_SYNC_PRESENT
     LDAP_CONTROL_SYNC_STATE LDAP_CONTROL_SYNC_DONE
 ];
 use Net::LDAP::Extension::Cancel;
@@ -24,10 +24,18 @@ with "MooX::Role::WeakClosure";
 
 has LDAP        => is => "ro";
 has callback    => is => "rw";
-has cookie      => is => "rw";
+has cookie      => is => "rw", trigger => 1;
 
 has search      => is => "rw", predicate => 1, clearer => 1;
 has cache       => is => "ro", predicate => 1;
+has state       => is => "rwp", default => "idle";
+has _present    => (
+    is          => "ro",
+    lazy        => 1,
+    default     => sub { +{} },
+    predicate   => 1,
+    clearer     => 1,
+);
 
 sub BUILDARGS {
     my ($class, @args) = @_;
@@ -46,22 +54,20 @@ my $UUID = Data::UUID->new;
 
 sub info { warn "$_[0]\n" }
 
+sub _trigger_cookie {
+    my ($self, $new) = @_;
+    info "NEW COOKIE [$new]";
+}
+
 sub update_cookie {
     my ($self, $from) = @_;
     $from or return;
 
     my ($ck, $control);
     if ($from->isa("Net::LDAP::Message")) {
-        $control = $from->control(
-            LDAP_CONTROL_SYNC_STATE, LDAP_CONTROL_SYNC_DONE,
-        );
         $control and $ck = $control->cookie;
     }
     elsif ($from->isa("Net::LDAP::Intermediate::SyncInfo")) {
-        $ck = $from->newcookie
-            // $from->{asn}{refreshDelete}{cookie}
-            // $from->{asn}{refreshPresent}{cookie}
-            // $from->{asn}{syncIdSet}{cookie};
     }
     if ($ck) {
         info "COOKIE [$from] [$ck]";
@@ -70,22 +76,114 @@ sub update_cookie {
     $control;
 }
 
-sub update_cache {
-    my ($self, $entry, $control) = @_;
-    my $cache = $self->cache;
+sub _change_state {
+    my ($self, $new) = @_;
+    my $old = $self->state;
 
-    my $st = $control->state;
-    my $uu = $control->entryUUID;
+    info "STATE CHANGE [$old] -> [$new]";
+
+    if ($old eq "refresh" 
+        && $self->_has_present
+        && $self->has_cache
+    ) {
+        my $p = $self->_present;
+        my $c = $self->cache;
+        $$p{$_} or do { 
+            my $uua = $UUID->to_string($_);
+            info "NOT PRESENT [$uua]"; 
+            delete $$c{$_};
+        } for keys %$c;
+        $self->_clear_present;
+    }
+
+    if ($new eq "refresh") {
+        $self->_clear_present;
+    }
+
+    $self->_set_state($new);
+}
+
+sub _handle_entry {
+    my ($self, $entry, $from) = @_;
+
+    my $control = $from->control(
+        LDAP_CONTROL_SYNC_STATE, LDAP_CONTROL_SYNC_DONE,
+    ) or return;
+
+    if (my $ck = $control->cookie) {
+        $self->cookie($ck);
+    }
+
+    $self->has_cache and $self->_handle_cache_entry($entry, $control);
+
+    return $control;
+}
+
+sub _handle_cache_entry {
+    my ($self, $entry, $control) = @_;
+
+    my $st  = $control->state;
+    my $uu  = $control->entryUUID;
+    my $uua = $UUID->to_string($uu);
+
     if ($st == LDAP_SYNC_ADD || $st == LDAP_SYNC_MODIFY) {
-        $$cache{$uu} = $entry;
+        info "ADD/MOD [$uua] [@{[$entry->dn]}]";
+        $self->cache->{$uu} = $entry;
     }
     elsif ($st == LDAP_SYNC_DELETE) {
-        delete $$cache{$uu};
+        info "DELETE [$uua] [@{[$self->cache->{$uu}->dn]}]";
+        delete $self->cache->{$uu};
+    }
+    elsif ($st == LDAP_SYNC_PRESENT) {
+        info "PRESENT [$uua] [@{[$self->cache->{$uu}->dn]}]";
+        $self->_present->{$uu} = 1;
     }
     else {
-        # PRESENT
         die "Unknown sync info state [$st]";
     }
+}
+
+# Sync Info is sent in the following circumstances:
+#
+#   - newcookie may be sent at any time, and just updates the cookie.
+#
+#   - syncIdSet may be sent at any time, and are equivalent to some set
+#     of SYNC_PRESENT or SYNC_DELETE entry results. refreshDeletes says
+#     which.
+#
+#   - refreshPresent and refreshDelete are sent at the end of each phase
+#     of the refresh stage, if this is not the end of the whole search.
+#     Which is sent indicates which phase has just ended (I don't care).
+#     refreshDone indicates whether we have entered a new phase of refresh
+#     or moved onto the persist stage.
+
+sub _handle_info {
+    my ($self, $info) = @_;
+
+    my $ck  = $info->newcookie;
+    my $asn = $info->{asn};
+
+    info "SYNC INFO: " . pp $asn;
+
+    if (my $set = $$asn{syncIdSet}) {
+        $ck     = $$set{cookie};
+        my $uus = $$set{syncUUIDs};
+
+        if ($$set{refreshDeletes}) {
+            my $c = $self->cache;
+            delete $$c{$_} for @$uus;
+        }
+        else {
+            my $p = $self->_present;
+            $$p{$_} = 1 for @$uus;
+        }
+    }
+    elsif (my $end = $$asn{refreshPresent} // $$asn{refreshDelete}) {
+        $ck = $$end{cookie};
+        $$end{refreshDone} and $self->_change_state("persist");
+    }
+
+    $ck and $self->cookie($ck);
 }
 
 sub results {
@@ -146,21 +244,21 @@ sub _thaw_1 {
 }
 
 sub _do_callback {
-    my ($self, $srch, $entry, $ref) = @_;
-    info "CALLBACK [$entry]";
-    my $control = $self->update_cookie($srch);
+    my ($self, $srch, $res, $ref) = @_;
+    info "CALLBACK [$res]";
 
-    if (!$entry) {  return }
-    elsif ($entry->isa("Net::LDAP::Entry")) {
-        $self->has_cache and $self->update_cache($entry, $control);
-        $self->callback->($srch, $entry, $ref, $control)
+    if (!$res) { return }
+    elsif ($res->isa("Net::LDAP::Entry")) {
+        my $control = $self->_handle_entry($res, $srch);
+        $self->state eq "persist"
+            and $self->callback->($srch, $res, $ref, $control)
             and $self->stop_sync;
     }
-    elsif ($entry->isa("Net::LDAP::Intermediate::SyncInfo")) {
-        $self->update_cookie($entry);
+    elsif ($res->isa("Net::LDAP::Intermediate::SyncInfo")) {
+        $self->_handle_info($res);
     }
     else {
-        info "UNKNOWN ENTRY [$entry]";
+        info "UNKNOWN RESULT [$res]";
     }
 }
 
@@ -187,13 +285,16 @@ sub start_sync {
         control     => [$req],
     );
     info "SEARCH STARTED [$srch]";
+    $self->_change_state("refresh");
     $self->search($srch);
     $srch;
 }
 
 sub _search { 
-    $_[0]->search
-        or croak "[$_[0]] is not currently syncing";
+    my ($self) = @_;
+    $self->state eq "idle"
+        and croak "[$self] is not currently syncing";
+    $self->search;
 }
 
 sub wait_for_sync {
@@ -210,6 +311,8 @@ sub sync_done {
 
     my $srch = $self->_search;
     $srch->done or return;
+
+    $self->_change_state("idle");
 
     die sprintf "[$srch]: LDAP error: %s [%d] (%s)",
         $srch->error, $srch->code, $@
