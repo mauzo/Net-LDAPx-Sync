@@ -270,7 +270,7 @@ sub _do_callback {
 }
 
 sub start_sync {
-    my ($self, $desc, %params) = @_;
+    my ($self, %params) = @_;
 
     $self->has_search and croak "[$self] already has a search";
 
