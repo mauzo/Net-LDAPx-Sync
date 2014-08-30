@@ -1,5 +1,42 @@
 package Net::LDAPx::Sync;
 
+=head1 NAME
+
+Net::LDAPx::Sync - Perform an RFC 4533 sync operation with an LDAP server
+
+=head1 SYNOPSIS
+
+    use Net::LDAP;
+    use Net::LDAPx::Sync;
+
+    my $LDAP = Net::LDAP->new(...);
+    my $sync = Net::LDAPx::Sync->new(
+        LDAP        => $LDAP,
+        cache       => 1,
+        callback    => sub {...},
+    );
+
+    $sync->start_sync(
+        base    => ...,
+        filter  => ...,
+        persist => 1,
+    );
+    $sync->wait_for_sync;
+
+    process_results $sync->results;
+    write_to_file $sync->freeze;
+
+=head1 DESCRIPTION
+
+A C<Net::LDAPx::Sync> object represents an RFC 4533 Sync Session with an
+LDAP server. This LDAP extension provides a way to keep an up-to-date
+local cache of the results of a search, including immediate notification
+of changes while the sync operation is active. It is possible to save
+the results of the search to a file and restart the sync later without
+retransferring the data already received.
+
+=cut
+
 use Moo;
 no warnings "uninitialized";
 
@@ -22,13 +59,62 @@ our $VERSION = "0";
 
 with "MooX::Role::WeakClosure";
 
+=head1 ATTRIBUTES
+
+C<Net::LDAPx::Sync> is build using L<Moo>, so attributes can be passed
+to the constructor as either a hash or a hashref, and accessed with
+accessor methods. Most are read-only, at least publically.
+
+=head2 LDAP
+
+A L<Net::LDAP> object to use to communicate with the LDAP server.
+
+=cut
+
 has LDAP        => is => "ro";
+
+=head2 callback
+
+A subref to be called when new entries arrive in the persist stage of a
+refreshAndPersist sync session. This attribute is read-write.
+
+=cut
+
 has callback    => is => "rw";
+
+=head2 cookie
+
+The most recent cookie returned from the server for this search. If the
+C<Sync> object is caching results it's important that this cookie
+correctly corresponds to the state of the cache.
+
+=cut
+
 has cookie      => is => "rw", trigger => 1;
+
+=head2 state
+
+This returns the current state of the sync session, one of C<idle>,
+C<refresh> or C<persist>. C<idle> means the object currently has no
+search active. See the RFC for the details of the refresh and persist
+stages of the sync search.
+
+This attribute cannot be set in the constructor; C<Sync> objects always
+start in the C<idle> state.
+
+=cut
+
+has state       => is => "rwp", default => "idle", init_arg => undef;
+
+=for private
+search      the currently-active search, if any,
+cache       our local results cache, keyed by entryUUID.
+_present    used in the 'present' phase to record entries still present.
+
+=cut
 
 has search      => is => "rw", predicate => 1, clearer => 1;
 has cache       => is => "ro", predicate => 1;
-has state       => is => "rwp", default => "idle";
 has _present    => (
     is          => "ro",
     lazy        => 1,
@@ -36,6 +122,35 @@ has _present    => (
     predicate   => 1,
     clearer     => 1,
 );
+
+=head1 METHODS
+
+=head2 new
+
+    my $sync = Net::LDAPx::Sync->new(%atts);
+
+This is the constructor. In addition to the attributes listed above, the
+following keys can be passed:
+
+=over 4
+
+=item cache
+
+Specifies whether the C<Sync> object should maintain an internal cache
+of the results of the search. If C<1> is passed a private hashref will
+be used. Alternatively, a hashref can be passed, and the C<Sync> object
+will use that. The hash contains L<Net::LDAP::Entry> objects, and is
+keyed by C<entryUUID>.
+
+=item thaw
+
+This should specify a data structure returned from L</freeze> on a
+C<Sync> object referencing the same search on the same server. It will
+build a new object which will continue the same sync session.
+
+=back
+
+=cut
 
 sub BUILDARGS {
     my ($class, @args) = @_;
@@ -193,11 +308,33 @@ sub _handle_info {
     $self->_maybe_cookie($ck);
 }
 
+=head2 results
+
+    my @results = $sync->results;
+
+Returns the currently cached results of the search, as updated by the
+sync operation. This method should only be called if the C<Sync> object
+has a cache.
+
+=cut
+
 sub results {
     my ($self) = @_;
     my $cache = $self->cache;
     values %$cache;
 }
+
+=head2 freeze
+
+    my $data = $sync->freeze;
+
+Freezes the current state of the cache and the current cookie into a
+plain Perl data structure, which can be written out to a file and used
+to resume the sync session later. The data structure should be
+considered opaque, but it will contain no objects and no circular refs,
+so it is suitable for serializing as JSON or YAML.
+
+=cut
 
 my $FreezeVersion = 1;
 
@@ -269,6 +406,36 @@ sub _do_callback {
     }
 }
 
+=head2 start_sync
+
+    my $search = $sync->start_sync(
+        base    => ...,
+        filter  => ...,
+        persist => 1,
+    );
+
+Start a sync search, moving the C<Sync> object from state C<idle> to
+C<refresh>. The C<persist> parameter controls whether this is a
+persistent search: if it is false, the search will retrieve any changed
+entries, update the cache if any, and finish; if it is true, the search
+will continue after the refresh phase waiting for the server to send
+down changes as they happen. If the search enters the C<persist> phase,
+it will not finish until either the L</stop_sync> method is called or
+the server chooses to terminate it. 
+
+Returns a L<Net::LDAP::Search> object representing the search in
+progress. If the C<Net::LDAP> object we are using is in C<async> mode,
+it will return as soon as the search has been sent to the server,
+without waiting for results. Use the L</sync_done> and L</wait_for_sync>
+methods to determine when the search has finished. Otherwise, it will
+not return until the search has finished, which for C<< persist => 1 >>
+searches will not usually happen until L</stop_sync> is called.
+
+It is necessary to call the L</sync_done> method once the search has
+finished, to finish the internal bookkeeping.
+             
+=cut
+
 sub start_sync {
     my ($self, %params) = @_;
 
@@ -276,7 +443,6 @@ sub start_sync {
 
     my $L       = $self->LDAP;
     my $persist = delete $params{persist} // 1;
-    my $cb      = delete $params{callback};
 
     my $req = Net::LDAP::Control::SyncRequest->new(
         critical    => 1,
@@ -304,6 +470,16 @@ sub _search {
     $self->search;
 }
 
+=head2 wait_for_sync
+
+    my $cookie = $sync->wait_for_sync;
+
+Waits for a currently-active sync search to finish, and returns the
+final cookie from the server (if any). Throws an exception if we are not
+currently searching. This will call L</sync_done> for you.
+
+=cut
+
 sub wait_for_sync {
     my ($self) = @_;
 
@@ -312,6 +488,15 @@ sub wait_for_sync {
     $srch->sync;
     $self->sync_done;
 }
+
+=head2 sync_done
+
+    my $done = $sync->sync_done;
+
+Returns the most recent cookie from the server if the search has
+finished. If it has not, returns the empty list without blocking.
+
+=cut
 
 sub sync_done {
     my ($self) = @_;
@@ -336,6 +521,14 @@ sub sync_done {
     return $self->cookie;
 }
 
+=head2 stop_sync
+
+    $sync->stop_sync;
+
+Sends a LDAP Cancel operation to cancel an in-progress sync search. This is normally the only way of stopping a refreshAndPersist search.
+
+=cut
+
 sub stop_sync {
     my ($self) = @_;
     my $srch = $self->_search;
@@ -343,6 +536,26 @@ sub stop_sync {
     my $cancel = $self->LDAP->cancel($srch);
     $cancel->control(LDAP_CONTROL_SYNC_DONE)
         and info "GOT A SyncDone FROM A CANCEL";
+    $cancel;
 }
 
 1;
+
+=head1 SEE ALSO
+
+L<Net::LDAP>, RFC 4533.
+
+=head1 BUGS
+
+Please report any bugs to <bug-Net-LDAPx-Sync@rt.cpan.org>.
+
+=head1 AUTHOR
+
+Ben Morrow <ben@morrow.me.uk>
+
+=head1 COPYRIGHT
+
+Copyright 2014 Ben Morrow.
+
+Released under the 2-clause BSD licence.
+
