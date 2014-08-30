@@ -52,7 +52,16 @@ sub BUILDARGS {
 # I think someone doesn't understand what objects are for...
 my $UUID = Data::UUID->new;
 
-sub info { warn "$_[0]\n" }
+sub info {
+    my ($fmt, @args) = @_;
+    my $str = @args ? sprintf $fmt, @args : $fmt;
+    warn "$str\n";
+}
+
+sub _maybe_cookie {
+    my ($self, $ck) = @_;
+    $ck and $self->cookie($ck);
+}
 
 sub _trigger_cookie {
     my ($self, $new) = @_;
@@ -76,43 +85,38 @@ sub update_cookie {
     $control;
 }
 
-sub _change_state {
-    my ($self, $new) = @_;
-    my $old = $self->state;
+sub _trigger_state {
+    my ($self, $state) = @_;
 
-    info "STATE CHANGE [$old] -> [$new]";
+    $state eq "refresh" and $self->_clear_present;
+}
 
-    if ($old eq "refresh" 
-        && $self->_has_present
-        && $self->has_cache
-    ) {
-        my $p = $self->_present;
-        my $c = $self->cache;
-        $$p{$_} or do { 
-            my $uua = $UUID->to_string($_);
-            info "NOT PRESENT [$uua]"; 
-            delete $$c{$_};
-        } for keys %$c;
-        $self->_clear_present;
+sub _process_present {
+    my ($self) = @_;
+
+    my $c = $self->cache;
+    unless ($self->_has_present) {
+        info "NO ENTRIES PRESENT";
+        %$c = ();
+        return;
     }
 
-    if ($new eq "refresh") {
-        $self->_clear_present;
+    my $p = $self->_present;
+    for (keys %$c) {
+        $$p{$_} and next;
+        my $uua = $UUID->to_string($_);
+        info "NOT PRESENT [$uua]"; 
+        delete $$c{$_};
     }
-
-    $self->_set_state($new);
+    $self->_clear_present;
 }
 
 sub _handle_entry {
     my ($self, $entry, $from) = @_;
 
-    my $control = $from->control(
-        LDAP_CONTROL_SYNC_STATE, LDAP_CONTROL_SYNC_DONE,
-    ) or return;
-
-    if (my $ck = $control->cookie) {
-        $self->cookie($ck);
-    }
+    my $control = $from->control(LDAP_CONTROL_SYNC_STATE)
+        or return;
+    $self->_maybe_cookie($control->cookie);
 
     $self->has_cache and $self->_handle_cache_entry($entry, $control);
 
@@ -122,21 +126,22 @@ sub _handle_entry {
 sub _handle_cache_entry {
     my ($self, $entry, $control) = @_;
 
+    my $c   = $self->cache;
     my $st  = $control->state;
     my $uu  = $control->entryUUID;
     my $uua = $UUID->to_string($uu);
-
+    
     if ($st == LDAP_SYNC_ADD || $st == LDAP_SYNC_MODIFY) {
-        info "ADD/MOD [$uua] [@{[$entry->dn]}]";
-        $self->cache->{$uu} = $entry;
+        $$c{$uu} = $entry;
+        info "ADD/MOD [%s] [%s]", $uua, $entry->dn;
     }
     elsif ($st == LDAP_SYNC_DELETE) {
-        info "DELETE [$uua] [@{[$self->cache->{$uu}->dn]}]";
-        delete $self->cache->{$uu};
+        my $entry = delete $$c{$uu};
+        info "DELETE [%s] [%s]", $uua, $entry->dn;
     }
     elsif ($st == LDAP_SYNC_PRESENT) {
-        info "PRESENT [$uua] [@{[$self->cache->{$uu}->dn]}]";
         $self->_present->{$uu} = 1;
+        info "PRESENT [%s] [%s]", $uua, $$c{$uu}->dn;
     }
     else {
         die "Unknown sync info state [$st]";
@@ -153,9 +158,10 @@ sub _handle_cache_entry {
 #
 #   - refreshPresent and refreshDelete are sent at the end of each phase
 #     of the refresh stage, if this is not the end of the whole search.
-#     Which is sent indicates which phase has just ended (I don't care).
-#     refreshDone indicates whether we have entered a new phase of refresh
-#     or moved onto the persist stage.
+#     Which is sent indicates which phase has just ended. This matters
+#     because a 'present' phase with no SYNC_PRESENT results should
+#     clear the cache. refreshDone indicates whether we have entered a
+#     new phase of refresh or moved onto the persist stage.
 
 sub _handle_info {
     my ($self, $info) = @_;
@@ -179,11 +185,12 @@ sub _handle_info {
         }
     }
     elsif (my $end = $$asn{refreshPresent} // $$asn{refreshDelete}) {
+        $$asn{refreshPresent} and $self->_process_present;
         $ck = $$end{cookie};
-        $$end{refreshDone} and $self->_change_state("persist");
+        $$end{refreshDone} and $self->_set_state("persist");
     }
 
-    $ck and $self->cookie($ck);
+    $self->_maybe_cookie($ck);
 }
 
 sub results {
@@ -285,7 +292,7 @@ sub start_sync {
         control     => [$req],
     );
     info "SEARCH STARTED [$srch]";
-    $self->_change_state("refresh");
+    $self->_set_state("refresh");
     $self->search($srch);
     $srch;
 }
@@ -312,16 +319,20 @@ sub sync_done {
     my $srch = $self->_search;
     $srch->done or return;
 
-    $self->_change_state("idle");
+    info "SEARCH FINISHED";
+    $self->clear_search;
 
     die sprintf "[$srch]: LDAP error: %s [%d] (%s)",
         $srch->error, $srch->code, $@
         unless $srch->code == LDAP_SUCCESS ||
             $srch->code == LDAP_CANCELED;
-    info "SEARCH FINISHED";
 
-    $self->update_cookie($srch);
-    $self->clear_search;
+    if (my $control = $srch->control(LDAP_CONTROL_SYNC_DONE)) {
+        $self->_maybe_cookie($control->cookie);
+        $control->refreshDeletes or $self->_process_present;
+    }
+    $self->_set_state("idle");
+
     return $self->cookie;
 }
 
@@ -329,7 +340,9 @@ sub stop_sync {
     my ($self) = @_;
     my $srch = $self->_search;
     info "CANCEL SEARCH [$srch]";
-    $self->update_cookie($self->LDAP->cancel($srch));
+    my $cancel = $self->LDAP->cancel($srch);
+    $cancel->control(LDAP_CONTROL_SYNC_DONE)
+        and info "GOT A SyncDone FROM A CANCEL";
 }
 
 1;
