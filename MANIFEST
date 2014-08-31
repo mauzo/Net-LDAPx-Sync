@@ -1,0 +1,7 @@
+Build.PL
+Changes
+lib/Net/LDAPx/Sync.pm
+MANIFEST			This list of files
+t/00use.t
+META.yml
+META.json

@@ -2,7 +2,7 @@ package Net::LDAPx::Sync;
 
 =head1 NAME
 
-Net::LDAPx::Sync - Perform an RFC 4533 sync operation with an LDAP server
+Net::LDAPx::Sync - Perform an RFC 4533 LDAP sync
 
 =head1 SYNOPSIS
 
@@ -41,7 +41,6 @@ use Moo;
 no warnings "uninitialized";
 
 use Carp;
-use Data::Dump  qw/pp/;
 use Data::UUID;
 use Try::Tiny;
 
@@ -283,8 +282,6 @@ sub _handle_info {
 
     my $ck  = $info->newcookie;
     my $asn = $info->{asn};
-
-    info "SYNC INFO: " . pp $asn;
 
     if (my $set = $$asn{syncIdSet}) {
         $ck     = $$set{cookie};
