@@ -9,19 +9,16 @@ Net::LDAPx::Sync - Perform an RFC 4533 LDAP sync
     use Net::LDAP;
     use Net::LDAPx::Sync;
 
-    my $LDAP = Net::LDAP->new(...);
     my $sync = Net::LDAPx::Sync->new(
-        LDAP        => $LDAP,
+        LDAP        => Net::LDAP->new(...),
         cache       => 1,
-        callback    => sub {...},
+        callbacks   => { change => sub { ... } },
     );
 
-    $sync->start_sync(
+    $sync->sync(
         base    => ...,
         filter  => ...,
-        persist => 1,
     );
-    $sync->wait_for_sync;
 
     process_results $sync->results;
     write_to_file $sync->freeze;
@@ -103,7 +100,12 @@ start in the C<idle> state.
 
 =cut
 
-has state       => is => "rwp", default => "idle", init_arg => undef;
+has state => (
+    is          => "rwp", 
+    default     => "idle", 
+    init_arg    => undef,
+    trigger     => 1,
+);
 
 =for private
 search      the currently-active search, if any,
@@ -168,8 +170,14 @@ my $UUID = Data::UUID->new;
 
 sub info {
     my ($fmt, @args) = @_;
-    my $str = @args ? sprintf $fmt, @args : $fmt;
-    warn "$str\n";
+    my $msg = @args ? sprintf $fmt, @args : $fmt;
+    warn "$msg\n";
+}
+
+sub panic {
+    my ($self, $fmt, @args);
+    my $msg = @args ? sprintf $fmt, @args : $fmt;
+    die "Internal error: [$self]: $msg\n";
 }
 
 sub _maybe_cookie {
@@ -182,26 +190,10 @@ sub _trigger_cookie {
     info "NEW COOKIE [$new]";
 }
 
-sub update_cookie {
-    my ($self, $from) = @_;
-    $from or return;
-
-    my ($ck, $control);
-    if ($from->isa("Net::LDAP::Message")) {
-        $control and $ck = $control->cookie;
-    }
-    elsif ($from->isa("Net::LDAP::Intermediate::SyncInfo")) {
-    }
-    if ($ck) {
-        info "COOKIE [$from] [$ck]";
-        $self->cookie($ck);
-    }
-    $control;
-}
-
 sub _trigger_state {
     my ($self, $state) = @_;
 
+    info "STATE CHANGE [$state]";
     $state eq "refresh" and $self->_clear_present;
 }
 
@@ -223,6 +215,23 @@ sub _process_present {
         delete $$c{$_};
     }
     $self->_clear_present;
+}
+
+sub _handle_search {
+    my ($self, $srch) = @_;
+
+    my $st = $self->state;
+    my $cl = (caller 1)[3];
+    info "HANDLE SEARCH [$st] FROM [$cl]";
+
+    if ($st eq "starting") {
+        info "SEARCH STARTED [$srch]";
+        $self->search($srch);
+        $self->_set_state("refresh");
+    }
+
+    $st ne "idle" && $srch->done 
+        and $self->_sync_done;
 }
 
 sub _handle_entry {
@@ -386,13 +395,15 @@ sub _thaw_1 {
 
 sub _do_callback {
     my ($self, $srch, $res, $ref) = @_;
-    info "CALLBACK [$res]";
+    my $st = $self->state;
+    info "CALLBACK [$st] [$res]";
+
+    $self->_handle_search($srch);
 
     if (!$res) { return }
     elsif ($res->isa("Net::LDAP::Entry")) {
         my $control = $self->_handle_entry($res, $srch);
-        $self->state eq "persist"
-            and $self->callback->($srch, $res, $ref, $control)
+        $self->callback->($srch, $res, $ref, $control)
             and $self->stop_sync;
     }
     elsif ($res->isa("Net::LDAP::Intermediate::SyncInfo")) {
@@ -403,9 +414,9 @@ sub _do_callback {
     }
 }
 
-=head2 start_sync
+=head2 sync
 
-    my $search = $sync->start_sync(
+    my $search = $sync->sync(
         base    => ...,
         filter  => ...,
         persist => 1,
@@ -428,18 +439,15 @@ methods to determine when the search has finished. Otherwise, it will
 not return until the search has finished, which for C<< persist => 1 >>
 searches will not usually happen until L</stop_sync> is called.
 
-It is necessary to call the L</sync_done> method once the search has
-finished, to finish the internal bookkeeping.
-             
 =cut
 
-sub start_sync {
+sub sync {
     my ($self, %params) = @_;
 
-    $self->has_search and croak "[$self] already has a search";
+    $self->state eq "idle" or croak "[$self] is already syncing";
 
     my $L       = $self->LDAP;
-    my $persist = delete $params{persist} // 1;
+    my $persist = delete $params{persist};
 
     my $req = Net::LDAP::Control::SyncRequest->new(
         critical    => 1,
@@ -449,60 +457,40 @@ sub start_sync {
     );
 
     info "STARTING SEARCH [$req]";
+    $self->_set_state("starting");
     my $srch = $L->search(
         %params,
         callback    => $self->weak_method("_do_callback"),
         control     => [$req],
     );
-    info "SEARCH STARTED [$srch]";
-    $self->_set_state("refresh");
-    $self->search($srch);
+    $self->_handle_search($srch);
     $srch;
 }
 
-sub _search { 
-    my ($self) = @_;
-    $self->state eq "idle"
-        and croak "[$self] is not currently syncing";
-    $self->search;
-}
+=head2 wait_for_idle
 
-=head2 wait_for_sync
+    $sync->wait_for_idle;
 
-    my $cookie = $sync->wait_for_sync;
-
-Waits for a currently-active sync search to finish, and returns the
-final cookie from the server (if any). Throws an exception if we are not
-currently searching. This will call L</sync_done> for you.
+Wait until the sync session returns to the C<idle> state. If a search is
+currently active this will block until it has finished.
 
 =cut
 
-sub wait_for_sync {
+sub wait_for_idle {
     my ($self) = @_;
 
-    my $srch = $self->_search;
+    $self->state eq "idle" and return;
+    my $srch = $self->search
+        or $self->panic("wait_for_idle called with no search");
     info "WAIT FOR [$srch]";
     $srch->sync;
-    $self->sync_done;
 }
 
-=head2 sync_done
-
-    my $done = $sync->sync_done;
-
-Returns the most recent cookie from the server if the search has
-finished. If it has not, returns the empty list without blocking.
-
-=cut
-
-sub sync_done {
+sub _sync_done {
     my ($self) = @_;
 
-    my $srch = $self->_search;
-    $srch->done or return;
-
-    info "SEARCH FINISHED";
-    $self->clear_search;
+    my $srch = $self->clear_search;
+    info "SEARCH FINISHED [$srch]";
 
     die sprintf "[$srch]: LDAP error: %s [%d] (%s)",
         $srch->error, $srch->code, $@
@@ -514,21 +502,21 @@ sub sync_done {
         $control->refreshDeletes or $self->_process_present;
     }
     $self->_set_state("idle");
-
-    return $self->cookie;
 }
 
 =head2 stop_sync
 
-    $sync->stop_sync;
+    my $cancel = $sync->stop_sync;
 
-Sends a LDAP Cancel operation to cancel an in-progress sync search. This is normally the only way of stopping a refreshAndPersist search.
+Sends a LDAP Cancel operation to cancel an in-progress sync search. This
+is normally the only way of stopping a refreshAndPersist search. Returns
+a L<Net::LDAP::Message> representing the Cancel request.
 
 =cut
 
 sub stop_sync {
     my ($self) = @_;
-    my $srch = $self->_search;
+    my $srch = $self->search;
     info "CANCEL SEARCH [$srch]";
     my $cancel = $self->LDAP->cancel($srch);
     $cancel->control(LDAP_CONTROL_SYNC_DONE)
