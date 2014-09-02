@@ -35,6 +35,8 @@ use Moo;
 no warnings "uninitialized";
 
 use Carp;
+use Clone           qw/clone/;
+use Data::Compare;  # exports Compare
 use Data::UUID;
 use Try::Tiny;
 
@@ -372,7 +374,7 @@ so it is suitable for serializing as JSON or YAML.
 
 =cut
 
-my $FreezeVersion = 1;
+my $FreezeVersion = 2;
 
 sub freeze {
     my ($self) = @_;
@@ -380,6 +382,7 @@ sub freeze {
 
     return {
         version     => $FreezeVersion,
+        search      => clone($self->search),
         cookie      => $self->cookie,
         cache       => {
             map {
@@ -405,6 +408,24 @@ sub _thaw {
         or croak "Unknown freeze version [$vers]";
 
     $class->$meth($data, $args);
+}
+
+sub _thaw_2 {
+    my ($class, $data, $args) = @_;
+
+    $class->_thaw_1($data, $args);
+
+    my $new = $$data{search} or return;
+    if (my $old = $$args{search}) {
+        unless (Compare $old, $new) {
+            info "SEARCH PARAMS DIFFER, DISCARDING CACHE";
+            delete $$args{cookie};
+            exists $$args{cache} and %{$$args{cache}} = ();
+        }
+    }
+    else {
+        $$args{search} = $new;
+    }
 }
 
 sub _thaw_1 {
