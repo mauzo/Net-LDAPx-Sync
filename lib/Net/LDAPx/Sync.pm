@@ -12,13 +12,10 @@ Net::LDAPx::Sync - Perform an RFC 4533 LDAP sync
     my $sync = Net::LDAPx::Sync->new(
         LDAP        => Net::LDAP->new(...),
         cache       => 1,
+        search      => { base => ..., filter => ... }
         callbacks   => { change => sub { ... } },
     );
-
-    $sync->sync(
-        base    => ...,
-        filter  => ...,
-    );
+    $sync->sync;
 
     process_results $sync->results;
     write_to_file $sync->freeze;
@@ -78,6 +75,15 @@ correctly corresponds to the state of the cache.
 =cut
 
 has cookie      => is => "rw", trigger => 1;
+
+=head2 search
+
+A hashref of parameters to pass to C<< Net::LDAP->search >> to initiate
+the sync search.
+
+=cut
+
+has search      => is => "ro";
 
 =head2 state
 
@@ -438,11 +444,7 @@ sub _ldap_callback {
 
 =head2 sync
 
-    my $search = $sync->sync(
-        base    => ...,
-        filter  => ...,
-        persist => 1,
-    );
+    my $search = $sync->sync(persist => 1);
 
 Start a sync search, moving the C<Sync> object from state C<idle> to
 C<refresh>. The C<persist> parameter controls whether this is a
@@ -481,7 +483,7 @@ sub sync {
     info "STARTING SEARCH [$req]";
     $self->_set_state("starting");
     my $srch = $L->search(
-        %params,
+        %{$self->search},
         callback    => $self->weak_method("_ldap_callback"),
         control     => [$req],
     );
