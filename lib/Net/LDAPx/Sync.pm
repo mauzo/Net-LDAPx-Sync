@@ -69,15 +69,6 @@ A L<Net::LDAP> object to use to communicate with the LDAP server.
 
 has LDAP        => is => "ro";
 
-=head2 callback
-
-A subref to be called when new entries arrive in the persist stage of a
-refreshAndPersist sync session. This attribute is read-write.
-
-=cut
-
-has callback    => is => "rw";
-
 =head2 cookie
 
 The most recent cookie returned from the server for this search. If the
@@ -108,14 +99,22 @@ has state => (
 );
 
 =for private
-search      the currently-active search, if any,
 cache       our local results cache, keyed by entryUUID.
-_present    used in the 'present' phase to record entries still present.
+callbacks   hashref of callback subs
+dirty       indicates if there are changes we haven't sent 'change' for
+present     used in the 'present' phase to record entries still present.
+search      the currently-active search, if any,
 
 =cut
 
-has search      => is => "rw", predicate => 1, clearer => 1;
-has cache       => is => "ro", predicate => 1;
+has _cache      => is => "ro", predicate => 1, init_arg => "cache";
+has _callbacks  => (
+    is          => "ro",
+    lazy        => 1,
+    default     => sub { +{} },
+    init_arg => "callbacks",
+);
+has _dirty      => is => "rw", default => 0, init_arg => undef;
 has _present    => (
     is          => "ro",
     lazy        => 1,
@@ -123,6 +122,7 @@ has _present    => (
     predicate   => 1,
     clearer     => 1,
 );
+has _search     => is => "rw", clearer => 1;
 
 =head1 METHODS
 
@@ -142,6 +142,11 @@ of the results of the search. If C<1> is passed a private hashref will
 be used. Alternatively, a hashref can be passed, and the C<Sync> object
 will use that. The hash contains L<Net::LDAP::Entry> objects, and is
 keyed by C<entryUUID>.
+
+=item callbacks
+
+Specifies a hashref of callbacks. The hashref passed may be modified, so
+don't share it with other objects. See L</CALLBACKS> for valid keys.
 
 =item thaw
 
@@ -188,6 +193,7 @@ sub _maybe_cookie {
 sub _trigger_cookie {
     my ($self, $new) = @_;
     info "NEW COOKIE [$new]";
+    $self->_callback("cookie", $new);
 }
 
 sub _trigger_state {
@@ -195,15 +201,36 @@ sub _trigger_state {
 
     info "STATE CHANGE [$state]";
     $state eq "refresh" and $self->_clear_present;
+    $state eq "starting" or $self->_callback($state);
+
+    if ($self->_dirty) {
+        $self->_dirty(0);
+        $self->_callback("change");
+    }
+}
+
+sub _dirtify {
+    my ($self) = @_;
+    if ($self->state eq "persist") {
+        $self->_callback("change");
+    }
+    else {
+        $self->_dirty(1);
+    }
 }
 
 sub _process_present {
     my ($self) = @_;
 
-    my $c = $self->cache;
+    my $c   = $self->_cache;
+    my $cb  = $self->_has_callback("delete");
     unless ($self->_has_present) {
         info "NO ENTRIES PRESENT";
+        my %old = $cb ? %$c : ();
         %$c = ();
+        if (%old) {
+            $self->$cb($old{$_}, $_) for keys %old;
+        }
         return;
     }
 
@@ -212,9 +239,11 @@ sub _process_present {
         $$p{$_} and next;
         my $uua = $UUID->to_string($_);
         info "NOT PRESENT [$uua]"; 
-        delete $$c{$_};
+        my $old = delete $$c{$_};
+        $cb and $self->$cb($old, $_);
     }
     $self->_clear_present;
+    $self->_dirtify;
 }
 
 sub _handle_search {
@@ -226,12 +255,31 @@ sub _handle_search {
 
     if ($st eq "starting") {
         info "SEARCH STARTED [$srch]";
-        $self->search($srch);
+        $self->_search($srch);
         $self->_set_state("refresh");
     }
 
     $st ne "idle" && $srch->done 
         and $self->_sync_done;
+}
+
+sub _handle_change {
+    my ($self, $type, $uuid, $new) = @_;
+
+    my $c   = $self->_cache;
+    my $old = $$c{$uuid};
+
+    my @args;
+    for ($type) {
+        /add/       and @args = $$c{$uuid} = $new;
+        /modify/    and @args = ($$c{$uuid}, $new), $$c{$uuid} = $new;
+        /delete/    and @args = delete $$c{$uuid};
+        /present/   and $self->_present->{$uuid} = 1;
+    }
+    info "%s [%s]%s", uc $type, $UUID->to_string($uuid),
+        join "", map " [$_]", map $_->dn, @args;
+
+    @args and $self->_callback($type, @args);
 }
 
 sub _handle_entry {
@@ -241,34 +289,15 @@ sub _handle_entry {
         or return;
     $self->_maybe_cookie($control->cookie);
 
-    $self->has_cache and $self->_handle_cache_entry($entry, $control);
+    my $st  = $control->state;
+    my $typ = (qw/present add modify delete/)[$st]
+        or $self->panic("Unknown sync state [$st]");
+    my $uu  = $control->entryUUID;
+
+    $self->_handle_change($typ, $uu, $entry);
+    $self->_dirtify;
 
     return $control;
-}
-
-sub _handle_cache_entry {
-    my ($self, $entry, $control) = @_;
-
-    my $c   = $self->cache;
-    my $st  = $control->state;
-    my $uu  = $control->entryUUID;
-    my $uua = $UUID->to_string($uu);
-    
-    if ($st == LDAP_SYNC_ADD || $st == LDAP_SYNC_MODIFY) {
-        $$c{$uu} = $entry;
-        info "ADD/MOD [%s] [%s]", $uua, $entry->dn;
-    }
-    elsif ($st == LDAP_SYNC_DELETE) {
-        my $entry = delete $$c{$uu};
-        info "DELETE [%s] [%s]", $uua, $entry->dn;
-    }
-    elsif ($st == LDAP_SYNC_PRESENT) {
-        $self->_present->{$uu} = 1;
-        info "PRESENT [%s] [%s]", $uua, $$c{$uu}->dn;
-    }
-    else {
-        die "Unknown sync info state [$st]";
-    }
 }
 
 # Sync Info is sent in the following circumstances:
@@ -295,15 +324,10 @@ sub _handle_info {
     if (my $set = $$asn{syncIdSet}) {
         $ck     = $$set{cookie};
         my $uus = $$set{syncUUIDs};
+        my $typ = $$set{refreshDeletes} ? "delete" : "present";
 
-        if ($$set{refreshDeletes}) {
-            my $c = $self->cache;
-            delete $$c{$_} for @$uus;
-        }
-        else {
-            my $p = $self->_present;
-            $$p{$_} = 1 for @$uus;
-        }
+        $self->_handle_change($typ, $_) for @$uus;
+        $self->_dirtify;
     }
     elsif (my $end = $$asn{refreshPresent} // $$asn{refreshDelete}) {
         $$asn{refreshPresent} and $self->_process_present;
@@ -326,7 +350,7 @@ has a cache.
 
 sub results {
     my ($self) = @_;
-    my $cache = $self->cache;
+    my $cache = $self->_cache;
     values %$cache;
 }
 
@@ -346,7 +370,7 @@ my $FreezeVersion = 1;
 
 sub freeze {
     my ($self) = @_;
-    my $cache = $self->cache or return;
+    my $cache = $self->_cache or return;
 
     return {
         version     => $FreezeVersion,
@@ -393,7 +417,7 @@ sub _thaw_1 {
     };
 }
 
-sub _do_callback {
+sub _ldap_callback {
     my ($self, $srch, $res, $ref) = @_;
     my $st = $self->state;
     info "CALLBACK [$st] [$res]";
@@ -403,8 +427,6 @@ sub _do_callback {
     if (!$res) { return }
     elsif ($res->isa("Net::LDAP::Entry")) {
         my $control = $self->_handle_entry($res, $srch);
-        $self->callback->($srch, $res, $ref, $control)
-            and $self->stop_sync;
     }
     elsif ($res->isa("Net::LDAP::Intermediate::SyncInfo")) {
         $self->_handle_info($res);
@@ -460,7 +482,7 @@ sub sync {
     $self->_set_state("starting");
     my $srch = $L->search(
         %params,
-        callback    => $self->weak_method("_do_callback"),
+        callback    => $self->weak_method("_ldap_callback"),
         control     => [$req],
     );
     $self->_handle_search($srch);
@@ -480,7 +502,7 @@ sub wait_for_idle {
     my ($self) = @_;
 
     $self->state eq "idle" and return;
-    my $srch = $self->search
+    my $srch = $self->_search
         or $self->panic("wait_for_idle called with no search");
     info "WAIT FOR [$srch]";
     $srch->sync;
@@ -489,7 +511,7 @@ sub wait_for_idle {
 sub _sync_done {
     my ($self) = @_;
 
-    my $srch = $self->clear_search;
+    my $srch = $self->_clear_search;
     info "SEARCH FINISHED [$srch]";
 
     die sprintf "[$srch]: LDAP error: %s [%d] (%s)",
@@ -516,12 +538,98 @@ a L<Net::LDAP::Message> representing the Cancel request.
 
 sub stop_sync {
     my ($self) = @_;
-    my $srch = $self->search;
+    my $srch = $self->_search;
     info "CANCEL SEARCH [$srch]";
     my $cancel = $self->LDAP->cancel($srch);
     $cancel->control(LDAP_CONTROL_SYNC_DONE)
         and info "GOT A SyncDone FROM A CANCEL";
     $cancel;
+}
+
+=head1 CALLBACKS
+
+The C<Sync> constructor can specify several callbacks to be called when
+specific events occur. These callbacks can also, if you prefer, be
+implemented by subclassing C<Sync> and creating them as methods; in this
+case the method name is a callback name from the list below prefixed
+with C<on_>. Callbacks passed to the constructor will override callbacks
+specified as methods.
+
+Valid callbacks are listed below, with an example in method call syntax
+showing how they are called. Callbacks specified as subrefs are still
+called in method form, so the C<Sync> object will be passed as the first
+parameter. If the callback is a closure you should make use of this
+parameter rather than allowing it to close over the C<Sync> object, to
+avoid a reference loop.
+
+=over 4
+
+=item add
+
+    $sync->on_add($entry, $uuid);
+
+Called when the server reports a new entry has been added to the
+results. This includes the initial content fetch for a sync search with
+no starting cookie. C<$entry> is the new entry (or reference), C<$uuid>
+is its C<entryUUID>, in binary form.
+
+=item delete
+
+    $sync->on_delete($entry, $uuid);
+
+Called when the server reports an entry has been deleted. C<$entry> will
+only be available if the C<Sync> object is using a cache; otherwise,
+C<undef> will be passed.
+
+=item modify
+
+    $sync->on_modify($old, $new, $uuid);
+
+Called when the server reports and entry has been modified. C<$old> and
+C<$new> are the old and new versions of the entry; C<$old> will only be
+passed if the C<Sync> object is using a cache.
+
+=item cookie
+
+    $sync->on_cookie($cookie);
+
+Called when the server sends a new cookie.
+
+=item change
+
+    $sync->on_change;
+
+Called once at the end of the refresh stage if the server returned any
+changes at all; called again during the persist stage (if any) every
+time a new changed entry is returned. This will be called after
+C<add>/C<modify>/C<delete>.
+
+=item idle
+
+=item refresh
+
+=item persist
+
+    $sync->on_refresh;
+
+Called when the C<Sync> object changes state. (Note that the internal
+C<starting> state has no callback, since you should never see it.)
+
+=back
+
+=cut
+
+sub _has_callback {
+    my ($self, $which) = @_;
+
+    $self->_callbacks->{$which} ||= $self->can("on_which");
+}
+
+sub _callback {
+    my ($self, $which, @args) = @_;
+
+    my $cb = $self->_has_callback($which) or return;
+    $self->$cb(@args);
 }
 
 1;
